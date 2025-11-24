@@ -219,7 +219,6 @@ function download(config, server::StorageServer, resource::AbstractString,
     @info "successfully downloaded and verified" resource size=content.length Dates.now()
     return true
 end
-end
 
 function content_length(response::HTTP.Messages.Response)
     for h in response.headers
