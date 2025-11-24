@@ -127,22 +127,20 @@ const fetches_in_progress = Dict{String, FetchState}()
 function cached_fetch_resource(config::Config, resource::AbstractString)
     # The `/registries` resource is special since it needs to be
     # updated periodically.
-resource == "/registries" && update_registries(config)
+    resource == "/registries" && update_registries(config)
     path = cache_path(config, resource)
     isfile(path) && return path
-    
     return lock(fetch_lock) do
-        # Check again after acquiring lock
-        isfile(path) && return path
-        
+        temp_file = tempfilename(path)
         state = get!(fetches_in_progress, resource) do
-            temp_file = tempfilename(path)
             mkpath(dirname(temp_file))
             io = open(temp_file, "w")
             content = ContentState()
             task = @async begin
                 success = fetch_resource(config, resource, io, content)
                 close(io)
+                # Note: This lock call is not nested within the outer
+                # lock call but happens in a separate task.
                 lock(fetch_lock) do
                     if success
                         mkpath(dirname(path))
@@ -151,14 +149,11 @@ resource == "/registries" && update_registries(config)
                     delete!(fetches_in_progress, resource)
                 end
             end
+            # Return from do block, not from function.
             return FetchState(resource, content, task)
         end
-        
-        # Wait for the download to complete
-        wait(state.task)
-        
-        # Now return the final path
-        return path
+        # Return from do block, not from function.
+        return FetchInProgress(state, open(temp_file, "r"))
     end
 end
 
@@ -183,42 +178,29 @@ function tarball_git_hash(tarball::String)
     end
 end
 
-function download(config::Config, server::GitStorageServer,
-                  resource::AbstractString, io::IO, content::ContentState)
+function download(config, server::StorageServer, resource::AbstractString,
+                  io::IOStream, content::ContentState)
+    @info "downloading resource" server=server resource=resource Dates.now()
+    hash = let m = match(hash_part_re, resource)
+        m !== nothing ? m.captures[1] : nothing
+    end
 
-    # Extract the resource path from the git repository
-    git_path = joinpath(server.path, resource)
-    
-    if !isfile(git_path)
-        @warn "resource not found in git storage" path=git_path resource Dates.now()
+    if !get_resource_from_storage_server!(config, server, resource,
+                                          io, content)
         return false
     end
-    
-    @info "reading resource from git storage" path=git_path resource Dates.now()
-    
-    # Copy the file to the output stream
-    try
-        open(git_path, "r") do src
-            write(io, read(src))
+
+    # If we're given a hash, then check tarball git hash.
+    if hash !== nothing
+        temp_file = tempfilename(cache_path(config, resource))
+        tree_hash = tarball_git_hash(temp_file)
+        # Raise warnings about resource hash mismatches
+        if hash != tree_hash
+            @warn "resource hash mismatch" server=server resource=resource hash=tree_hash Dates.now()
+            return false
         end
-        flush(io)
-    catch e
-        @warn "failed to read from git storage" path=git_path exception=e Dates.now()
-        return false
     end
-    
-    content.done = true
-    
-    # Verify the hash
-    tree_hash = tarball_git_hash(io.name)
-    expected_hash = splitpath(resource)[end]
-    if tree_hash != expected_hash
-        @warn "resource hash mismatch" resource expected=expected_hash actual=tree_hash Dates.now()
-        return false
-    end
-    
-    content.length = stat(io.name).size
-    @info "successfully read and verified from git storage" resource size=content.length Dates.now()
+
     return true
 end
 
