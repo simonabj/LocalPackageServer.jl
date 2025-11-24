@@ -127,20 +127,22 @@ const fetches_in_progress = Dict{String, FetchState}()
 function cached_fetch_resource(config::Config, resource::AbstractString)
     # The `/registries` resource is special since it needs to be
     # updated periodically.
-    resource == "/registries" && update_registries(config)
+resource == "/registries" && update_registries(config)
     path = cache_path(config, resource)
     isfile(path) && return path
+    
     return lock(fetch_lock) do
-        temp_file = tempfilename(path)
+        # Check again after acquiring lock
+        isfile(path) && return path
+        
         state = get!(fetches_in_progress, resource) do
+            temp_file = tempfilename(path)
             mkpath(dirname(temp_file))
             io = open(temp_file, "w")
             content = ContentState()
             task = @async begin
                 success = fetch_resource(config, resource, io, content)
                 close(io)
-                # Note: This lock call is not nested within the outer
-                # lock call but happens in a separate task.
                 lock(fetch_lock) do
                     if success
                         mkpath(dirname(path))
@@ -149,11 +151,14 @@ function cached_fetch_resource(config::Config, resource::AbstractString)
                     delete!(fetches_in_progress, resource)
                 end
             end
-            # Return from do block, not from function.
             return FetchState(resource, content, task)
         end
-        # Return from do block, not from function.
-        return FetchInProgress(state, open(temp_file, "r"))
+        
+        # Wait for the download to complete
+        wait(state.task)
+        
+        # Now return the final path
+        return path
     end
 end
 
