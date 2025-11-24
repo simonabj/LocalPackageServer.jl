@@ -183,31 +183,33 @@ function tarball_git_hash(tarball::String)
     end
 end
 
-function download(config, server::StorageServer, resource::AbstractString,
-                  io::IOStream, content::ContentState)
-    url = string(server, resource)
-    @info "downloading resource" server resource Dates.now()
+function download(config::Config, server::GitStorageServer,
+                  resource::AbstractString, io::IO, content::ContentState)
+
+    # Extract the resource path from the git repository
+    git_path = joinpath(server.path, resource)
     
-    # Don't use response_stream with redirects - download to memory first
-    response = HTTP.get(url, status_exception = false, redirect = true)
-    
-    if response.status != 200
-        @warn "response status $(response.status)" url Dates.now()
+    if !isfile(git_path)
+        @warn "resource not found in git storage" path=git_path resource Dates.now()
         return false
     end
     
-    if isempty(response.body)
-        @warn "downloaded empty response" url Dates.now()
+    @info "reading resource from git storage" path=git_path resource Dates.now()
+    
+    # Copy the file to the output stream
+    try
+        open(git_path, "r") do src
+            write(io, read(src))
+        end
+        flush(io)
+    catch e
+        @warn "failed to read from git storage" path=git_path exception=e Dates.now()
         return false
     end
-    
-    # Write the downloaded data to the file
-    write(io, response.body)
-    flush(io)
     
     content.done = true
     
-    # Now verify the hash
+    # Verify the hash
     tree_hash = tarball_git_hash(io.name)
     expected_hash = splitpath(resource)[end]
     if tree_hash != expected_hash
@@ -216,7 +218,7 @@ function download(config, server::StorageServer, resource::AbstractString,
     end
     
     content.length = stat(io.name).size
-    @info "successfully downloaded and verified" resource size=content.length Dates.now()
+    @info "successfully read and verified from git storage" resource size=content.length Dates.now()
     return true
 end
 
