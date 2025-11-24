@@ -185,28 +185,40 @@ end
 
 function download(config, server::StorageServer, resource::AbstractString,
                   io::IOStream, content::ContentState)
-    @info "downloading resource" server=server resource=resource Dates.now()
-    hash = let m = match(hash_part_re, resource)
-        m !== nothing ? m.captures[1] : nothing
-    end
-
-    if !get_resource_from_storage_server!(config, server, resource,
-                                          io, content)
+    url = string(server, resource)
+    @info "downloading resource" server resource Dates.now()
+    
+    # Don't use response_stream with redirects - download to memory first
+    response = HTTP.get(url, status_exception = false, redirect = true)
+    
+    if response.status != 200
+        @warn "response status $(response.status)" url Dates.now()
         return false
     end
-
-    # If we're given a hash, then check tarball git hash.
-    if hash !== nothing
-        temp_file = tempfilename(cache_path(config, resource))
-        tree_hash = tarball_git_hash(temp_file)
-        # Raise warnings about resource hash mismatches
-        if hash != tree_hash
-            @warn "resource hash mismatch" server=server resource=resource hash=tree_hash Dates.now()
-            return false
-        end
+    
+    if isempty(response.body)
+        @warn "downloaded empty response" url Dates.now()
+        return false
     end
-
+    
+    # Write the downloaded data to the file
+    write(io, response.body)
+    flush(io)
+    
+    content.done = true
+    
+    # Now verify the hash
+    tree_hash = tarball_git_hash(io.name)
+    expected_hash = splitpath(resource)[end]
+    if tree_hash != expected_hash
+        @warn "resource hash mismatch" resource expected=expected_hash actual=tree_hash Dates.now()
+        return false
+    end
+    
+    content.length = stat(io.name).size
+    @info "successfully downloaded and verified" resource size=content.length Dates.now()
     return true
+end
 end
 
 function content_length(response::HTTP.Messages.Response)
